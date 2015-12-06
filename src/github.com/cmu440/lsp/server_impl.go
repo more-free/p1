@@ -3,7 +3,7 @@ package lsp
 
 import (
 	"fmt"
-	"net"
+	net "github.com/cmu440/lspnet"
 	"sync"
 	"time"
 )
@@ -11,6 +11,7 @@ import (
 type clientInfo struct {
 	addr              *net.UDPAddr
 	window            *Window
+	pending           []*Message
 	nextReadSeq       int
 	nextWriteSeq      int
 	inMsgChan         chan *Message
@@ -34,6 +35,7 @@ type server struct {
 	port       int
 	params     *Params
 	quit       bool
+	inMsgChan  chan *Message // global in-message channel, listening all client connections
 }
 
 // NewServer creates, initiates, and returns a new server. This function should
@@ -44,11 +46,12 @@ type server struct {
 // there was an error resolving or listening on the specified port number.
 func NewServer(port int, params *Params) (Server, error) {
 	server := &server{
-		conn:   make(map[int]*clientInfo),
-		mutex:  &sync.Mutex{},
-		port:   port,
-		params: params,
-		quit:   bool,
+		conn:      make(map[int]*clientInfo),
+		mutex:     &sync.Mutex{},
+		port:      port,
+		params:    params,
+		quit:      false,
+		inMsgChan: make(chan *Message),
 	}
 
 	addr, err := net.ResolveUDPAddr("udp4", fmt.Sprintf(":%v", port))
@@ -71,9 +74,9 @@ func (s *server) newClientInfo(addr *net.UDPAddr) *clientInfo {
 	return &clientInfo{
 		addr:              addr,
 		window:            NewWindow(s.params.WindowSize),
+		pending:           make([]*Message, 0),
 		nextReadSeq:       0,
 		nextWriteSeq:      0,
-		quitChan:          make(chan bool),
 		inMsgChan:         make(chan *Message, MAX_WRITE_BUFFER),
 		outMsgChan:        make(chan *Message, MAX_WRITE_BUFFER),
 		connActivityChan:  make(chan bool),
@@ -105,7 +108,6 @@ func (s *server) listen() {
 			fmt.Println(err.Error())
 			continue
 		}
-		fmt.Println("connection request from client", addr)
 		msg, err := FromBytes(data[:sz])
 		if err != nil {
 			fmt.Println(err.Error())
@@ -120,7 +122,6 @@ func (s *server) listen() {
 				s.mutex.Lock()
 				s.conn[connID] = s.newClientInfo(addr)
 				s.mutex.Unlock()
-				fmt.Println("connection established : ID =", connID)
 				go s.handleInMsg(connID)
 				go s.handleOutMsg(connID)
 				go s.handleEpochEvents(connID)
@@ -144,23 +145,39 @@ func (s *server) listen() {
 func (s *server) handleInMsg(connID int) {
 	ci, _ := s.conn[connID]
 
+	isExpected := func(msg *Message) bool {
+		return ci.nextReadSeq+1 == msg.SeqNum
+	}
+
+	notify := func(msg *Message) {
+		select {
+		case s.inMsgChan <- msg:
+		default:
+		}
+	}
+
 	for {
 		select {
 		case msg := <-ci.inMsgChan:
 			// ignore non-ack message if the connection is going to close
 			if ci.closed && msg.Type != MsgAck {
-				break
+				break // break select
 			}
 
-			fmt.Println("receiving message on server : ", msg)
 			ci.keepConnAlive()
 
 			switch msg.Type {
 			case MsgData:
-				// we can ignore potential error due to epoch event handler
-				ci.outMsgChan <- GetAck(msg)
+				// we can ignore potential error as we have epoch event handler
 				ci.window.SendAck(msg)
+				ci.outMsgChan <- GetAck(msg)
+				// notify server the arrival of new message if the message arrived
+				// has an expected seqNum
+				if isExpected(msg) {
+					notify(msg)
+				}
 			case MsgAck:
+				fmt.Println("server is receiving ack", msg)
 				ci.window.ReceiveAck(msg)
 			}
 
@@ -187,8 +204,7 @@ Loop:
 				err := s.writeData(msg)
 				CheckError(err)
 			case MsgData:
-				err := s.writeData(msg)
-				ci.window.SendMsg(msg)
+				err := s.tryWriteMsg(msg, ci)
 				CheckError(err)
 			}
 
@@ -201,7 +217,7 @@ Loop:
 		// otherwise no further ack would be received
 		case <-ci.quitOutMsgHandler:
 			toQuit = true
-			ci.closed = true // block any server.Write()
+			ci.closed = true // block any following server.Write()
 
 			if len(ci.outMsgChan) == 0 && toQuit {
 				break Loop
@@ -212,6 +228,26 @@ Loop:
 	ci.outMsgQuit <- true
 }
 
+func (s *server) tryWriteMsg(msg *Message, ci *clientInfo) error {
+	err := ci.window.SendMsg(msg)
+	fmt.Println("server is sending msg", msg, err)
+	if err == nil {
+		return s.writeData(msg)
+	} else {
+		exists := false
+		for _, msg := range ci.pending {
+			if msg.SeqNum == msg.SeqNum {
+				exists = true
+				break
+			}
+		}
+		if !exists {
+			ci.pending = append(ci.pending, msg)
+		}
+		return nil
+	}
+}
+
 func (s *server) handleEpochEvents(connID int) {
 	ci, _ := s.conn[connID]
 	retry := 0
@@ -219,10 +255,13 @@ func (s *server) handleEpochEvents(connID int) {
 	for {
 		select {
 		case <-time.After(time.Duration(s.params.EpochMillis) * time.Millisecond):
-			retry++
-			if retry >= s.params.EpochLimit {
-				fmt.Println("quit due to too many inactive epoch")
-				return
+			if !ci.window.hasWaitingMessage() {
+				retry++
+				if retry > s.params.EpochLimit {
+					fmt.Println("quit due to too many inactive epoch")
+					s.CloseConn(connID)
+					return
+				}
 			}
 			go s.resend(connID)
 
@@ -264,6 +303,7 @@ func (s *server) resend(connID int) {
 	}
 
 	for _, msg := range ci.window.GetMsgForResend() {
+		fmt.Println("server resend msg", msg)
 		select {
 		case ci.outMsgChan <- msg:
 		default:
@@ -276,20 +316,33 @@ func (s *server) resend(connID int) {
 		default:
 		}
 	}
+
+	newPending := make([]*Message, 0)
+	for _, msg := range ci.pending {
+		fmt.Println("server resend pending msg", msg)
+		err := s.tryWriteMsg(msg, ci)
+		if err != nil {
+			newPending = append(newPending, msg)
+		}
+	}
+	ci.pending = newPending
 }
 
 func (s *server) Read() (int, []byte, error) {
+	// if any expected message already arrived, return it immediately
 	for connID, ci := range s.conn {
-		ci.nextReadSeq++
-		if msg := ci.window.getMessage(ci.nextReadSeq); msg != nil {
+		seqNum := ci.nextReadSeq + 1
+		if msg := ci.window.getMessage(seqNum); msg != nil {
+			ci.nextReadSeq = seqNum
 			return connID, msg.Payload, nil
 		}
 	}
 
-	inChan := make(chan *Message)
-	for connID, ci := range s.conn {
-
-	}
+	// otherwise, block on a global channel, until any message arrive
+	msg := <-s.inMsgChan
+	ci, _ := s.conn[msg.ConnID]
+	ci.nextReadSeq++
+	return msg.ConnID, msg.Payload, nil
 }
 
 func (s *server) Write(connID int, payload []byte) error {
@@ -305,7 +358,7 @@ func (s *server) Write(connID int, payload []byte) error {
 	msg := GetMessage(connID, ci.nextWriteSeq, payload)
 
 	select {
-	case s.outMsgChan <- msg:
+	case ci.outMsgChan <- msg:
 	default:
 		ci.nextWriteSeq--
 		return fmt.Errorf("server write buffer is full")
@@ -345,7 +398,7 @@ func (s *server) Close() error {
 
 	for connID, _ := range s.conn {
 		done := make(chan bool)
-		s.closeConn(done)
+		s.closeConn(connID, done)
 		<-done
 	}
 

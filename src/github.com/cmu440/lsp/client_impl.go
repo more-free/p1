@@ -4,7 +4,7 @@ package lsp
 
 import (
 	"fmt"
-	"net"
+	net "github.com/cmu440/lspnet"
 	"time"
 )
 
@@ -12,8 +12,9 @@ type client struct {
 	hostport      string
 	params        *Params
 	connId        int
-	conn          net.Conn
+	conn          *net.UDPConn
 	window        *Window
+	pending       []*Message
 	nextReadSeq   int
 	nextWriteSeq  int
 	readMsgChan   chan *Message
@@ -38,6 +39,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		params:        params,
 		connId:        -1,
 		window:        NewWindow(params.WindowSize),
+		pending:       make([]*Message, 0),
 		nextReadSeq:   0,
 		nextWriteSeq:  0,
 		readMsgChan:   make(chan *Message, params.WindowSize), // size is optional
@@ -81,7 +83,6 @@ func (c *client) buildConn() error {
 		case msg := <-c.readMsgChan:
 			if isConnBuilt(msg) {
 				c.connId = msg.ConnID
-				fmt.Println("Connection established : id = ", msg.ConnID)
 				return nil
 			}
 		case <-time.After(time.Duration(c.params.EpochMillis) * time.Millisecond):
@@ -108,7 +109,6 @@ func (c *client) readFromServer() {
 		if err != nil {
 			fmt.Errorf(err.Error())
 		} else {
-			fmt.Println("receiving message on client : ", msg)
 			c.readMsgChan <- msg
 		}
 	}
@@ -144,21 +144,35 @@ func (c *client) ConnID() int {
 }
 
 func (c *client) Read() ([]byte, error) {
+	msg, err := c.readMsg()
+	if err != nil {
+		return make([]byte, 0), err
+	} else {
+		return msg.Payload, nil
+	}
+}
+
+func (c *client) readMsg() (*Message, error) {
 	c.nextReadSeq++
 
 	// if the expected message has already been received, return it
 	if msg := c.window.getMessage(c.nextReadSeq); msg != nil {
-		return msg.ToBytes()
+		return msg, nil
 	}
 
 	retry := 0
 	for {
 		select {
 		case <-time.After(time.Duration(c.params.EpochMillis) * time.Millisecond):
+			if c.window.hasWaitingMessage() {
+				go c.resend()
+				break
+			}
+
 			retry++
-			if retry >= c.params.EpochLimit {
+			if retry > c.params.EpochLimit {
 				c.Close()
-				return make([]byte, 0), fmt.Errorf("No data received within given epochs")
+				return nil, fmt.Errorf("No data received within given epochs")
 			} else {
 				go c.resend()
 			}
@@ -167,11 +181,12 @@ func (c *client) Read() ([]byte, error) {
 			if msg.Type == MsgAck {
 				c.window.ReceiveAck(msg)
 			} else {
+				fmt.Println("client receives msg", msg)
+				c.window.SendAck(msg)
 				ack := GetAck(msg)
 				c.writeMsgChan <- ack
-				c.window.SendAck(msg)
 				if msg.SeqNum == c.nextReadSeq {
-					return msg.ToBytes()
+					return msg, nil
 				}
 			}
 		}
@@ -195,6 +210,19 @@ func (c *client) resend() {
 		default:
 		}
 	}
+
+	// resend all pending messages
+	newPending := make([]*Message, 0)
+	for _, msg := range c.pending {
+		err := c.window.SendMsg(msg)
+		if err == nil {
+			c.writeMsgChan <- msg
+		} else {
+			newPending = append(newPending, msg)
+		}
+	}
+
+	c.pending = newPending
 }
 
 func (c *client) Write(payload []byte) error {
@@ -212,8 +240,21 @@ func (c *client) Write(payload []byte) error {
 	}
 
 	// non-blocking until MAX_WRITE_BUFFER is reached
-	c.writeMsgChan <- msg
-	c.window.SendMsg(msg)
+	err := c.window.SendMsg(msg)
+	if err == nil {
+		c.writeMsgChan <- msg
+	} else {
+		exists := false
+		for _, m := range c.pending {
+			if m.SeqNum == msg.SeqNum {
+				exists = true
+				break
+			}
+		}
+		if !exists {
+			c.pending = append(c.pending, msg) // wait for next resend
+		}
+	}
 
 	return nil
 }

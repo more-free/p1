@@ -3,6 +3,7 @@
 package lsp
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
 	"runtime"
@@ -207,19 +208,11 @@ func TestClientWithEchoServer(t *testing.T) {
 
 	bytes, err := client.Read()
 	assertE(t, nil, err)
-	msg, err := FromBytes(bytes)
-	assertE(t, MsgData, msg.Type)
-	assertE(t, 1, msg.ConnID)
-	assertE(t, 1, msg.SeqNum)
-	assertE(t, "world", string(msg.Payload))
+	assertE(t, "world", string(bytes))
 
 	bytes, err = client.Read()
 	assertE(t, nil, err)
-	msg, err = FromBytes(bytes)
-	assertE(t, MsgData, msg.Type)
-	assertE(t, 1, msg.ConnID)
-	assertE(t, 2, msg.SeqNum)
-	assertE(t, "world2", string(msg.Payload))
+	assertE(t, "world2", string(bytes))
 
 	// server -> client. out-of-order delivery
 	err = server.WriteWithSeqNum(client.ConnID(), 4, []byte("world4"))
@@ -229,19 +222,11 @@ func TestClientWithEchoServer(t *testing.T) {
 
 	bytes, err = client.Read()
 	assertE(t, nil, err)
-	msg, err = FromBytes(bytes)
-	assertE(t, MsgData, msg.Type)
-	assertE(t, 1, msg.ConnID)
-	assertE(t, 3, msg.SeqNum)
-	assertE(t, "world3", string(msg.Payload))
+	assertE(t, "world3", string(bytes))
 
 	bytes, err = client.Read()
 	assertE(t, nil, err)
-	msg, err = FromBytes(bytes)
-	assertE(t, MsgData, msg.Type)
-	assertE(t, 1, msg.ConnID)
-	assertE(t, 4, msg.SeqNum)
-	assertE(t, "world4", string(msg.Payload))
+	assertE(t, "world4", string(bytes))
 
 	time.Sleep(time.Second * 1)
 }
@@ -276,4 +261,10 @@ func assertF(t *testing.T) func(expected, actual interface{}) {
 			t.Errorf("expected = %v, actual = %v", expected, actual)
 		}
 	}
+}
+
+func bytesToInt(bytes []byte) int {
+	var v int
+	json.Unmarshal(bytes, &v)
+	return v
 }

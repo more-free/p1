@@ -62,12 +62,32 @@ func (aw *AckWindow) AckSize() int {
 	return len(aw.acks)
 }
 
+func (mw *MsgWindow) hasWaitingMessage() bool {
+	has := false
+	for _, received := range mw.ack {
+		if !received {
+			has = true
+			break
+		}
+	}
+	return has
+}
+
 func (mw *MsgWindow) IsValidToSend(msg *Message) bool {
 	return mw.messages.Len() < mw.capacity ||
 		mw.ack[mw.messages.Front().Value.(*Message).SeqNum]
 }
 
+func (mw *MsgWindow) hasSent(msg *Message) bool {
+	_, exists := mw.ack[msg.SeqNum]
+	return exists
+}
+
 func (mw *MsgWindow) SendMsg(msg *Message) error {
+	if mw.hasSent(msg) { // ignore resending message
+		return nil
+	}
+
 	if !mw.IsValidToSend(msg) {
 		return fmt.Errorf("%v is a not valid seq num to send", msg.SeqNum)
 	}
@@ -95,6 +115,7 @@ func (mw *MsgWindow) GetMsgForResend() []*Message {
 			msgs = append(msgs, e.Value.(*Message))
 		}
 	}
+
 	return msgs
 }
 
@@ -127,6 +148,8 @@ func (aw *AckWindow) SendAck(msg *Message) error {
 		return fmt.Errorf("ack %v has been sent", msg.SeqNum)
 	}
 
+	// save original msg instead of just ack, as recently received messages might
+	// be resent later
 	aw.acks[msg.SeqNum] = msg
 	if len(aw.acks) > aw.capacity {
 		// can safely delete min now
@@ -137,8 +160,8 @@ func (aw *AckWindow) SendAck(msg *Message) error {
 
 func (aw *AckWindow) GetAckForResend() []*Message {
 	acks := make([]*Message, 0)
-	for _, ack := range aw.acks {
-		acks = append(acks, ack)
+	for _, msg := range aw.acks {
+		acks = append(acks, GetAck(msg))
 	}
 	return acks
 }
@@ -154,6 +177,7 @@ func (aw *AckWindow) getMinAck() *Message {
 	return minMsg
 }
 
+// get recently received message by seqNum
 func (aw *AckWindow) getMessage(seqNum int) *Message {
 	msg, exists := aw.acks[seqNum]
 	if !exists {
