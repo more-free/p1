@@ -4,7 +4,6 @@ import (
 	"container/list"
 	"encoding/json"
 	"fmt"
-	"sync"
 )
 
 const (
@@ -104,140 +103,25 @@ func CheckError(err error) {
 }
 
 type blockingQueue interface {
-	Push(m *Message)        // never block
-	Error(e error)          // explicitly push an error to the queue
+	Push(m *Message) error  // non-blocking.  return an error if it's closed
 	Pop() (*Message, error) // block. get error if it is closed while waiting for incoming messages
-	Top() (*Message, error) // non-blocking
-	Close()                 // unblocking any Pop() with nil
-}
-
-// the simplest blocking queue : one consumer & one producer
-type oneToOneBlockingQueue struct {
-	msgs     *list.List
-	arrival  chan struct{}
-	producer *sync.Mutex
-	consumer *sync.Mutex
-}
-
-func newOneToOneBlockingQueue() blockingQueue {
-	return &oneToOneBlockingQueue{
-		msgs:     list.New(),
-		arrival:  make(chan struct{}, 1),
-		producer: &sync.Mutex{},
-		consumer: &sync.Mutex{},
-	}
-}
-
-func (q *oneToOneBlockingQueue) Push(m *Message) {
-	q.producer.Lock()
-	defer q.producer.Unlock()
-
-	q.msgs.PushBack(m)
-	select {
-	case q.arrival <- struct{}{}:
-	default:
-	}
-}
-
-func (q *oneToOneBlockingQueue) Error(e error) {
-
-}
-
-func (q *oneToOneBlockingQueue) Top() (*Message, error) {
-	if q.msgs.Len() == 0 {
-		return nil, fmt.Errorf("empty queue")
-	} else {
-		return q.msgs.Front().Value.(*Message), nil
-	}
-}
-
-func (q *oneToOneBlockingQueue) Pop() (*Message, error) {
-	q.consumer.Lock()
-	defer q.consumer.Unlock()
-
-	var top *Message
-	for q.msgs.Len() <= 0 {
-		_, ok := <-q.arrival
-		if !ok {
-			return nil, fmt.Errorf("blocking queue closed")
-		}
-	}
-	top = q.popFirst()
-	return top, nil
-}
-
-func (q *oneToOneBlockingQueue) popFirst() *Message {
-	front := q.msgs.Front()
-	q.msgs.Remove(front)
-	return front.Value.(*Message)
-}
-
-func (q *oneToOneBlockingQueue) Close() {
-	close(q.arrival)
-}
-
-type fixedSizeBlockingQueue struct {
-	buffer chan *Message
-}
-
-func newFixedSizeBlockingQueue(size int) blockingQueue {
-	return &fixedSizeBlockingQueue{
-		buffer: make(chan *Message, size),
-	}
-}
-
-func (q *fixedSizeBlockingQueue) Push(m *Message) {
-	select {
-	case q.buffer <- m:
-	default:
-	}
-}
-
-func (q *fixedSizeBlockingQueue) Error(e error) {
-
-}
-
-func (q *fixedSizeBlockingQueue) Pop() (*Message, error) {
-	msg, ok := <-q.buffer
-	if ok {
-		return msg, nil
-	} else {
-		return nil, fmt.Errorf("blocking queue closed")
-	}
-}
-
-func (q *fixedSizeBlockingQueue) Top() (*Message, error) {
-	select {
-	case msg := <-q.buffer:
-		return msg, nil
-	default:
-		return nil, fmt.Errorf("empty queue")
-	}
-}
-
-func (q *fixedSizeBlockingQueue) Close() {
-	close(q.buffer)
-}
-
-type MsgPair struct {
-	msg *Message
-	err error
+	Close()                 // may cause error for push and pop
 }
 
 type unboundedBlockingQueue struct {
 	queue *list.List
-	push  chan *MsgPair
+	push  chan *Message
 	req   chan struct{}
-	res   chan *MsgPair
+	res   chan *Message
 	quit  chan struct{}
 }
 
 func newUnboundedBlockingQueue() blockingQueue {
 	q := &unboundedBlockingQueue{
 		queue: list.New(),
-		push:  make(chan *MsgPair),
+		push:  make(chan *Message),
 		req:   make(chan struct{}),
-		res:   make(chan *MsgPair),
+		res:   make(chan *Message),
 		quit:  make(chan struct{}),
 	}
 
@@ -267,33 +151,37 @@ func (q *unboundedBlockingQueue) start() {
 	}
 }
 
-func (q *unboundedBlockingQueue) popFirst() *MsgPair {
+func (q *unboundedBlockingQueue) popFirst() *Message {
 	front := q.queue.Front()
 	q.queue.Remove(front)
-	return front.Value.(*MsgPair)
+	return front.Value.(*Message)
 }
 
-func (q *unboundedBlockingQueue) Push(m *Message) {
-	q.push <- &MsgPair{m, nil}
-}
-
-func (q *unboundedBlockingQueue) Error(e error) {
-	q.push <- &MsgPair{nil, e}
+func (q *unboundedBlockingQueue) Push(m *Message) error {
+	select {
+	case <-q.quit:
+		return fmt.Errorf("blocking queue was closed")
+	case q.push <- m:
+		return nil
+	}
 }
 
 func (q *unboundedBlockingQueue) Pop() (*Message, error) {
-	q.req <- struct{}{}
-	p := <-q.res
-	return p.msg, p.err
-}
-
-// not thread safe
-func (q *unboundedBlockingQueue) Top() (*Message, error) {
-	if q.queue.Len() == 0 {
-		return nil, fmt.Errorf("empty queue")
+	err := func() (*Message, error) {
+		return nil, fmt.Errorf("blocking queue was closed")
 	}
-	front := q.queue.Front().Value.(*MsgPair)
-	return front.msg, front.err
+
+	select {
+	case <-q.quit:
+		return err()
+	case q.req <- struct{}{}:
+		select {
+		case <-q.quit:
+			return err()
+		case m := <-q.res:
+			return m, nil
+		}
+	}
 }
 
 func (q *unboundedBlockingQueue) Close() {

@@ -9,7 +9,6 @@ func TestUnbounedBlockingQueue(t *testing.T) {
 	runtime.GOMAXPROCS(2)
 
 	q := newUnboundedBlockingQueue()
-	defer q.Close()
 	size := 100
 	res := make(chan *Message, size)
 
@@ -18,8 +17,12 @@ func TestUnbounedBlockingQueue(t *testing.T) {
 	}
 
 	pop := func() {
-		msg, _ := q.Pop()
-		res <- msg
+		msg, err := q.Pop()
+		if err == nil {
+			res <- msg
+		} else {
+			res <- nil
+		}
 	}
 
 	for id := 0; id < size; id++ {
@@ -39,5 +42,18 @@ func TestUnbounedBlockingQueue(t *testing.T) {
 
 	if len(get) != size {
 		t.Errorf("expected %v but %v", size, len(get))
+	}
+
+	// pop should return non-nil error if the queue is closed
+	for i := 0; i < size; i++ {
+		go pop()
+	}
+
+	q.Close()
+	for i := 0; i < size; i++ {
+		msg := <-res
+		if msg != nil {
+			t.Errorf("expected nil message indicating non-nil error received")
+		}
 	}
 }

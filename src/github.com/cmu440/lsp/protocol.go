@@ -224,14 +224,18 @@ type LSPRunner struct {
 	outgoingData   *outgoingData
 	sentDataWindow *recentDataWindow
 	sentAckWindow  *recentAckWindow
-	inBuffer       blockingQueue
-	closed         bool
 
-	// event signals
-	epochAlive chan struct{}
-	msgArrival chan *Message
-	close      chan struct{} // broadcasting close signal
-	done       chan bool     // ready to close, where false means quit with error
+	// all received messages are stored here temporarily until a Read() is called.
+	// bounded by the sliding window size, the max size of the buffer is window size
+	inBuffer blockingQueue
+
+	// a unique signal indicating the status of runner
+	closed bool
+
+	// events
+	epochAlive chan struct{} // get epoch alive signal during regular stage
+	msgArrival chan *Message // get message arrival signal during post-stop stage
+	quit       chan struct{} // broadcasting quit signal
 }
 
 func NewLSPRunner(rw MsgReadWriter, params *Params) *LSPRunner {
@@ -248,8 +252,7 @@ func NewLSPRunner(rw MsgReadWriter, params *Params) *LSPRunner {
 		sentAckWindow:  newRecentAckWindow(params.WindowSize),
 		epochAlive:     make(chan struct{}),
 		msgArrival:     make(chan *Message),
-		close:          make(chan struct{}),
-		done:           make(chan bool),
+		quit:           make(chan struct{}),
 	}
 }
 
@@ -288,8 +291,12 @@ func (r *LSPRunner) Write(payload []byte) error {
 blocking. return the next expected data.
 */
 func (r *LSPRunner) Read() ([]byte, error) {
+	if r.closed {
+		return EmptyPayload(), fmt.Errorf("reading data from closed LSPRunner")
+	}
+
 	msg, err := r.inBuffer.Pop()
-	if err != nil {
+	if err != nil { // runner closed -> inBuffer closed -> non-nil error
 		return EmptyPayload(), err
 	} else {
 		return msg.Payload, nil
@@ -300,11 +307,7 @@ func (r *LSPRunner) Read() ([]byte, error) {
 blocking. return the next expected data.
 */
 func (r *LSPRunner) readNext() ([]byte, error) {
-	empty := make([]byte, 0)
-
-	if r.closed {
-		return empty, fmt.Errorf("reading from closed LSPRunner")
-	}
+	empty := EmptyMsg()
 
 	// if already in incoming data, return it
 	if r.incomingData.Contains(r.nextRead) {
@@ -313,22 +316,28 @@ func (r *LSPRunner) readNext() ([]byte, error) {
 		return msg.Payload, err
 	}
 
-	for !r.closed {
+	for {
 		msg, err := r.rw.Read()
-		if err != nil { // rw is closed either due to epoch timeout, or due to an explicit close()
+
+		// runner closed -> rw closed -> non-nil error
+		// rw is closed either due to epoch timeout, or due to an explicit close()
+		if err != nil {
 			return empty, err
 		}
 
-		r.keepEpochAlive() // we received data, so keep epoch alive
+		if !r.keepEpochAlive() { // we received data, so keep epoch alive
+			// if keepEpochAlive() returns false, runner is in the post-stop stage,
+			// then notify msgArrival channel used in post-stop stage
+			r.notifyMsgArrival(msg)
+		}
 
 		if IsAck(msg) {
 			r.receiveAck(msg)
-			r.notifyAckArrival(msg)
 		} else if IsData(msg) {
 			// the received data is what we want (i.e., it has 'nextRead' seqNum)
 			if payload, err := r.receiveData(msg); err == nil {
 				return payload, nil
-			}
+			} // otherwise continue reading the next message
 		} else {
 			return empty, fmt.Errorf("only ack or data message is allowed") // should never happen
 		}
@@ -337,12 +346,19 @@ func (r *LSPRunner) readNext() ([]byte, error) {
 	return empty, fmt.Errorf("reading from closed LSPRunner")
 }
 
-func (r *LSPRunner) keepEpochAlive() {
-	r.epochAlive <- struct{}{}
+func (r *LSPRunner) keepEpochAlive() bool {
+	// in case startEpoch() has quited and returned (so that it blocks forever)
+	select {
+	case <-r.quit:
+		return false
+	case r.epochAlive <- struct{}{}:
+		return true
+	}
 }
 
-func (r *LSPRunner) notifyAckArrival(msg *Message) {
+func (r *LSPRunner) notifyMsgArrival(msg *Message) bool {
 	r.msgArrival <- msg
+	return true
 }
 
 /*
@@ -352,7 +368,7 @@ func (r *LSPRunner) receiveAck(ack *Message) {
 	// shrink the data window
 	r.sentDataWindow.Remove(ack.SeqNum)
 
-	r.resendOutgoingData() // go ?
+	r.resendOutgoingData() // should make it thread-safe and run in go routine
 }
 
 func (r *LSPRunner) resendOutgoingData() error {
@@ -381,7 +397,7 @@ Send Ack, update ack window (save ack for future resend),
 if data is the next expected one, return it to caller; otherwise save data to received queue
 */
 func (r *LSPRunner) receiveData(data *Message) ([]byte, error) {
-	empty := make([]byte, 0)
+	empty := EmptyMsg()
 
 	// send ack whenever a data message arrives
 	ack := GetAck(data)
@@ -404,7 +420,7 @@ func (r *LSPRunner) receiveData(data *Message) ([]byte, error) {
 
 /*
 Resend recent unacknowledged data; resend recent ack; resend pending data queue.
-this is a read-only method, so race condition won't be an issue
+TODO note now it may cause some issues because resendOutgoingData() is not thread-safe
 */
 func (r *LSPRunner) resend() {
 	for _, data := range r.sentDataWindow.GetAll() {
@@ -428,42 +444,27 @@ func (r *LSPRunner) startReader() {
 		payload, err := r.readNext()
 		if err == nil {
 			r.inBuffer.Push(Msg(payload))
-		} else { // closeReader() was called
+		} else { // runner closed -> rw closed -> non-nil error for rw.Read() -> non-nil error for readNext()
 			break
 		}
 	}
 }
 
 /*
-Start epoch. blocking.
+Start epoch. blocking. Before quiting this method, all other running methods should return.
 */
 func (r *LSPRunner) startEpoch() {
 	inactiveEpoch := 0
 	received := false
-	closing := false
-	isReadyToClose := func() bool {
-		return r.outgoingData.Len() == 0 &&
-			r.sentDataWindow.Len() == 0
-	}
 
 	for {
+		// all event handlers must be non-blocking
 		select {
 		case <-r.epochAlive:
 			received = true
 
-		case <-r.close:
-			closing = true
-			if isReadyToClose() {
-				r.done <- true
-				return
-			}
-
-		case <-r.msgArrival:
-			// close gracefully
-			if closing && isReadyToClose() {
-				r.done <- true
-				return
-			}
+		case <-r.quit:
+			return
 
 		case <-time.After(time.Duration(r.params.EpochMillis) * time.Millisecond):
 			if received {
@@ -476,23 +477,14 @@ func (r *LSPRunner) startEpoch() {
 			if inactiveEpoch < r.params.EpochLimit {
 				go r.resend()
 			} else {
-				break // epoch timeout
+				close(r.quit) // broadcasting quit epoch explicitly
+				break         // epoch timeout
 			}
 		}
 	}
 
 	// Close self due to epoch timeout
-	fmt.Println("epoch timeout, should not happen")
 	r.stopNow()
-}
-
-func (r *LSPRunner) stopReader() {
-	r.rw.Close()
-}
-
-func (r *LSPRunner) stopEpoch() {
-	r.close <- struct{}{}
-	<-r.done
 }
 
 /*
@@ -503,16 +495,71 @@ func (r *LSPRunner) Stop() error {
 		return fmt.Errorf("LSPRunner has been closed")
 	}
 
-	r.stopReader()
-	r.stopEpoch() // TODO race condition with stopNow() called in startEpoch()
+	// quit startEpoch()
+	close(r.quit)
 
-	r.inBuffer.Close()
-	r.closed = true
-	return nil
+	// wait until pending messages are sent
+	err := r.postStop()
+
+	// stop
+	r.stopNow()
+	return err
 }
 
-// do not wait for epoch to stop gracefully
-func (r *LSPRunner) stopNow() {
+/*
+though the requirement only mentions : sending all pending data until they are acknowledged,  it also
+makes sense to only wait for couple of epoch, applying the same epoch timeout rule.
+*/
+func (r *LSPRunner) postStop() error {
+	ready := func() bool {
+		return r.outgoingData.Len() == 0 &&
+			r.sentDataWindow.Len() == 0
+	}
+
+	if ready() {
+		return nil
+	}
+
+	err := r.resendOutgoingData()
+	if err != nil {
+		return fmt.Errorf("failed in post-stop step : ", err)
+	}
+
+	inactiveEpoch := 0
+	received := false
+	for {
+		select {
+		case <-r.msgArrival: // any further msg will be sent here
+			received = true
+			if ready() {
+				return nil
+			}
+
+		case <-time.After(time.Duration(r.params.EpochMillis) * time.Millisecond):
+			if received {
+				inactiveEpoch = 0
+			} else {
+				inactiveEpoch++
+			}
+
+			received = false
+			if inactiveEpoch >= r.params.EpochLimit {
+				return fmt.Errorf("epoch timeout in post-stop step")
+			}
+		}
+	}
+}
+
+// stop immediately without sending pending data
+func (r *LSPRunner) stopNow() error {
+	if r.closed {
+		return fmt.Errorf("LSPRunner has been closed")
+	}
+
+	// close all opened resources here
 	r.closed = true
-	r.stopReader()
+	close(r.msgArrival)
+	r.rw.Close()       // close reader (readNext())
+	r.inBuffer.Close() // close Read()
+	return nil
 }
