@@ -83,7 +83,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		client: udpClient,
 		connId: connId,
 	}
-	lspRunner := NewLSPRunner(rw, params)
+	lspRunner := NewLSPRunner(LSPClient, rw, params)
 	lspRunner.Start() // non-blocking
 
 	return &client{
@@ -91,19 +91,25 @@ func NewClient(hostport string, params *Params) (Client, error) {
 	}, nil
 }
 
+// TODO too low-level. should move to protocol layer
 func initConn(c UDPClient, params *Params) (int, error) {
 	req, _ := GetConnRequest().ToBytes()
 	res := EmptyMsg()
 
 	quit := make(chan struct{})
+	connTimeout := false
 
 	// keep sending connection request until conn ack is received
 	go func() {
+		inactiveEpoch := 0
 		for {
 			select {
 			case <-time.After(time.Duration(params.EpochMillis) * time.Millisecond):
-				_, err := c.Write(req)
-				if err != nil {
+				c.Write(req)
+				inactiveEpoch++
+				if inactiveEpoch >= params.EpochLimit {
+					c.Close()
+					connTimeout = true
 					return
 				}
 			case <-quit:
@@ -113,17 +119,17 @@ func initConn(c UDPClient, params *Params) (int, error) {
 	}()
 
 	defer close(quit)
-	for {
-		sz, err := c.Read(res)
-		if err != nil {
-			return -1, err
-		}
-
+	for !connTimeout {
+		// ignore error during connection build stage
+		// it may receive connection refused error. network_test describes this error.
+		sz, _ := c.Read(res)
 		msg, err := FromBytes(res[:sz])
 		if err == nil && IsConnAck(msg) {
 			return msg.ConnID, nil
 		}
 	}
+
+	return -1, fmt.Errorf("failed to build connection")
 }
 
 func (c *client) ConnID() int {

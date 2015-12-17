@@ -73,6 +73,14 @@ func EmptyMsg() []byte {
 	return make([]byte, MAX_MSG_BYTES)
 }
 
+func EmptyAck(connId int) *Message {
+	return &Message{
+		Type:   MsgAck,
+		ConnID: connId,
+		SeqNum: 0,
+	}
+}
+
 func EmptyPayload() []byte {
 	return make([]byte, 0)
 }

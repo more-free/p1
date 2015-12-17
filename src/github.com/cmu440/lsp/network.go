@@ -40,7 +40,9 @@ func NewFixedSizeUDPClient(maxMsgSize int, serverHostPort string) (UDPClient, er
 		return nil, err
 	}
 
-	conn, err := net.DialUDP("udp", nil, serverAddr) // non-blocking. it won't wait for server to build connection as TCP does
+	// non-blocking. it won't wait for server to build connection as TCP does
+	// it returns non-nil error even though the server is not running. (no connection)
+	conn, err := net.DialUDP("udp", nil, serverAddr)
 	if err != nil {
 		return nil, err
 	}

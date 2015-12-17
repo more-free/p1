@@ -3,11 +3,11 @@ implementation of lsp protocol, shared by both sides (a peer-to-peer protocol ra
 - sliding window bound read/write
 - epoch driven resend data/ack
 - unbounded buffer size for pending incoming/outgoing data/ack
-- any part that is not shared by both sides are excluded, ex., building connection (client initiated)
 
 TODO optimize with tree or similar
 TODO methods are not thread-safe
 TODO too many blocking operations
+TODO add makeConn and listenConn part
 */
 package lsp
 
@@ -19,8 +19,8 @@ import (
 )
 
 type MsgReadWriter interface {
-	Read() (*Message, error)
-	Write(msg *Message) error
+	Read() (*Message, error)  // should block
+	Write(msg *Message) error // should not block
 	ConnID() int
 	Close() error
 }
@@ -214,8 +214,17 @@ func (c *recentAckWindow) GetAll() []*Message {
 	return acks
 }
 
+type LSPRunnerRole int
+
+const (
+	LSPClient LSPRunnerRole = iota
+	LSPServer
+)
+
 // Note its methods are NOT thread-safe
 type LSPRunner struct {
+	role LSPRunnerRole // for certain methods like startEpoch, different roles have different behavior.
+
 	rw             MsgReadWriter
 	params         *Params
 	nextRead       int
@@ -233,13 +242,14 @@ type LSPRunner struct {
 	closed bool
 
 	// events
-	epochAlive chan struct{} // get epoch alive signal during regular stage
+	epochAlive chan *Message // get epoch alive signal during regular stage
 	msgArrival chan *Message // get message arrival signal during post-stop stage
 	quit       chan struct{} // broadcasting quit signal
 }
 
-func NewLSPRunner(rw MsgReadWriter, params *Params) *LSPRunner {
+func NewLSPRunner(role LSPRunnerRole, rw MsgReadWriter, params *Params) *LSPRunner {
 	return &LSPRunner{
+		role:           role,
 		rw:             rw,
 		params:         params,
 		nextRead:       1,
@@ -250,7 +260,7 @@ func NewLSPRunner(rw MsgReadWriter, params *Params) *LSPRunner {
 		outgoingData:   newOutgoingData(),
 		sentDataWindow: newRecentDataWindow(params.WindowSize),
 		sentAckWindow:  newRecentAckWindow(params.WindowSize),
-		epochAlive:     make(chan struct{}),
+		epochAlive:     make(chan *Message),
 		msgArrival:     make(chan *Message),
 		quit:           make(chan struct{}),
 	}
@@ -325,14 +335,19 @@ func (r *LSPRunner) readNext() ([]byte, error) {
 			return empty, err
 		}
 
-		if !r.keepEpochAlive() { // we received data, so keep epoch alive
+		if !r.keepEpochAlive(msg) { // we received data, so keep epoch alive
 			// if keepEpochAlive() returns false, runner is in the post-stop stage,
 			// then notify msgArrival channel used in post-stop stage
 			r.notifyMsgArrival(msg)
 		}
 
 		if IsAck(msg) {
-			r.receiveAck(msg)
+			// corner case. ignore it.
+			if msg.SeqNum == 0 {
+				continue
+			} else {
+				r.receiveAck(msg)
+			}
 		} else if IsData(msg) {
 			// the received data is what we want (i.e., it has 'nextRead' seqNum)
 			if payload, err := r.receiveData(msg); err == nil {
@@ -346,12 +361,12 @@ func (r *LSPRunner) readNext() ([]byte, error) {
 	return empty, fmt.Errorf("reading from closed LSPRunner")
 }
 
-func (r *LSPRunner) keepEpochAlive() bool {
+func (r *LSPRunner) keepEpochAlive(msg *Message) bool {
 	// in case startEpoch() has quited and returned (so that it blocks forever)
 	select {
 	case <-r.quit:
 		return false
-	case r.epochAlive <- struct{}{}:
+	case r.epochAlive <- msg:
 		return true
 	}
 }
@@ -455,13 +470,17 @@ Start epoch. blocking. Before quiting this method, all other running methods sho
 */
 func (r *LSPRunner) startEpoch() {
 	inactiveEpoch := 0
-	received := false
+	received := false        // if any data has been received during last epoch
+	anyDataReceived := false // if any data has been received so far
 
 	for {
 		// all event handlers must be non-blocking
 		select {
-		case <-r.epochAlive:
+		case msg := <-r.epochAlive:
 			received = true
+			if msg.Type == MsgData {
+				anyDataReceived = true
+			}
 
 		case <-r.quit:
 			return
@@ -473,18 +492,23 @@ func (r *LSPRunner) startEpoch() {
 				inactiveEpoch++
 			}
 			received = false
+			if inactiveEpoch <= r.params.EpochLimit {
+				if !anyDataReceived {
+					if r.role == LSPClient {
+						r.rw.Write(EmptyAck(r.rw.ConnID()))
+					} else {
+						r.rw.Write(GetConnectionAck(r.rw.ConnID()))
+					}
+				}
 
-			if inactiveEpoch < r.params.EpochLimit {
-				go r.resend()
+				r.resend() // it will not block as long as rw.Write() is non-blocking
 			} else {
 				close(r.quit) // broadcasting quit epoch explicitly
-				break         // epoch timeout
+				r.stopNow()   // Close self due to epoch timeout
+				return
 			}
 		}
 	}
-
-	// Close self due to epoch timeout
-	r.stopNow()
 }
 
 /*

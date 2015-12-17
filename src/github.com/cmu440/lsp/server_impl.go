@@ -62,7 +62,7 @@ type clientHandler struct {
 
 func newClientHandler(rw MsgReadWriter, params *Params, in blockingQueue) *clientHandler {
 	return &clientHandler{
-		lspRunner: NewLSPRunner(rw, params),
+		lspRunner: NewLSPRunner(LSPServer, rw, params),
 		in:        in,
 	}
 }
@@ -78,7 +78,7 @@ type server struct {
 	in         blockingQueue        // listening any incoming message
 	quit       chan struct{}        // broadcast to multi clientHandler
 	addrToId   map[string]int       // client addr -> connID
-	idToAddr   map[int]*net.UDPAddr // connID -> client addr. reverse lookup TODO do we need this ?
+	idToAddr   map[int]*net.UDPAddr // connID -> client addr. reverse lookup
 	nextConnId int
 	handlers   map[int]*clientHandler // connID -> clientHandler
 }
@@ -138,9 +138,7 @@ func (s *server) listen() {
 				s.handleDataAck(m)
 			}
 
-			// TODO do we really need this ?
 		case <-s.quit:
-			log.Printf("exiting listener")
 			return
 		}
 	}
