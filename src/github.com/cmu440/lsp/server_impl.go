@@ -67,20 +67,21 @@ func newClientHandler(rw MsgReadWriter, params *Params, in blockingQueue) *clien
 	}
 }
 
-func (c *clientHandler) Close() {
-	c.in.Close()
-	c.lspRunner.Stop()
+func (c *clientHandler) Close() error {
+	// do not close in blockingQueue as it will be closed outside
+	return c.lspRunner.Stop()
 }
 
 type server struct {
-	params     *Params              // shared by multiple clientHandler
-	udpServer  UDPServer            // shared by multi clientHandler
-	in         blockingQueue        // listening any incoming message
-	quit       chan struct{}        // broadcast to multi clientHandler
-	addrToId   map[string]int       // client addr -> connID
-	idToAddr   map[int]*net.UDPAddr // connID -> client addr. reverse lookup
-	nextConnId int
-	handlers   map[int]*clientHandler // connID -> clientHandler
+	params      *Params              // shared by multiple clientHandler
+	udpServer   UDPServer            // shared by multi clientHandler
+	in          blockingQueue        // listening any incoming message
+	quit        chan struct{}        // broadcast to multi clientHandler
+	addrToId    map[string]int       // client addr -> connID
+	idToAddr    map[int]*net.UDPAddr // connID -> client addr. reverse lookup
+	nextConnId  int
+	handlers    map[int]*clientHandler // connID -> clientHandler
+	handlerStop chan int               // ->connId
 }
 
 // helper type definitions
@@ -103,14 +104,15 @@ func NewServer(port int, params *Params) (Server, error) {
 	}
 
 	s := &server{
-		params:     params,
-		udpServer:  udpServer,
-		in:         newUnboundedBlockingQueue(),
-		quit:       make(chan struct{}),
-		addrToId:   make(map[string]int),
-		idToAddr:   make(map[int]*net.UDPAddr),
-		nextConnId: 1,
-		handlers:   make(map[int]*clientHandler),
+		params:      params,
+		udpServer:   udpServer,
+		in:          newUnboundedBlockingQueue(),
+		quit:        make(chan struct{}),
+		addrToId:    make(map[string]int),
+		idToAddr:    make(map[int]*net.UDPAddr),
+		nextConnId:  1,
+		handlers:    make(map[int]*clientHandler),
+		handlerStop: make(chan int),
 	}
 
 	go s.listen()
@@ -138,6 +140,9 @@ func (s *server) listen() {
 				s.handleDataAck(m)
 			}
 
+		case id := <-s.handlerStop: // handler epoch timeout, lspRunner has already stopped
+			s.removeHandler(id)
+			s.in.Error(fmt.Errorf("client %v connection closed", id))
 		case <-s.quit:
 			return
 		}
@@ -178,6 +183,10 @@ func (s *server) handleConn(conn *inMsg) {
 		in := newUnboundedBlockingQueue()
 		rw := newServerMgsAdaptor(s.udpServer, s.nextConnId, conn.srcAddr, in)
 		handler := newClientHandler(rw, s.params, in)
+		handler.lspRunner.OnStop(func() {
+			s.handlerStop <- handler.lspRunner.rw.ConnID()
+		})
+
 		s.idToAddr[s.nextConnId] = conn.srcAddr
 		s.handlers[s.nextConnId] = handler
 
@@ -243,24 +252,32 @@ func (s *server) Write(connID int, payload []byte) error {
 	return handler.lspRunner.Write(payload)
 }
 
-// TODO make it non-blocking
 func (s *server) CloseConn(connID int) error {
 	handler, exists := s.handlers[connID]
 	if !exists {
 		return fmt.Errorf("connection id %v doesn't exist", connID)
 	}
-	err := handler.lspRunner.Stop()
-	addr := s.idToAddr[connID]
-	delete(s.idToAddr, connID)
-	delete(s.addrToId, addr.String())
-	delete(s.handlers, connID)
+
+	err := handler.Close()
+	s.removeHandler(connID)
 	return err
 }
 
-// TODO make it blocking
+func (s *server) removeHandler(connID int) {
+	addr, exists := s.idToAddr[connID]
+	if exists {
+		delete(s.idToAddr, connID)
+		delete(s.addrToId, addr.String())
+		delete(s.handlers, connID)
+	}
+}
+
 func (s *server) Close() error {
 	for connId, _ := range s.handlers {
 		s.CloseConn(connId)
 	}
+
+	s.in.Close()
+	close(s.quit)
 	return s.udpServer.Close()
 }

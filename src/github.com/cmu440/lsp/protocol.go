@@ -245,6 +245,9 @@ type LSPRunner struct {
 	epochAlive chan *Message // get epoch alive signal during regular stage
 	msgArrival chan *Message // get message arrival signal during post-stop stage
 	quit       chan struct{} // broadcasting quit signal
+
+	// lifecycle hook
+	onStop func()
 }
 
 func NewLSPRunner(role LSPRunnerRole, rw MsgReadWriter, params *Params) *LSPRunner {
@@ -263,6 +266,7 @@ func NewLSPRunner(role LSPRunnerRole, rw MsgReadWriter, params *Params) *LSPRunn
 		epochAlive:     make(chan *Message),
 		msgArrival:     make(chan *Message),
 		quit:           make(chan struct{}),
+		onStop:         nil,
 	}
 }
 
@@ -492,7 +496,7 @@ func (r *LSPRunner) startEpoch() {
 				inactiveEpoch++
 			}
 			received = false
-			if inactiveEpoch <= r.params.EpochLimit {
+			if inactiveEpoch < r.params.EpochLimit {
 				if !anyDataReceived {
 					if r.role == LSPClient {
 						r.rw.Write(EmptyAck(r.rw.ConnID()))
@@ -585,5 +589,14 @@ func (r *LSPRunner) stopNow() error {
 	close(r.msgArrival)
 	r.rw.Close()       // close reader (readNext())
 	r.inBuffer.Close() // close Read()
+
+	if r.onStop != nil {
+		r.onStop()
+	}
+
 	return nil
+}
+
+func (r *LSPRunner) OnStop(hook func()) {
+	r.onStop = hook
 }

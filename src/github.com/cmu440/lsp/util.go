@@ -110,26 +110,32 @@ func CheckError(err error) {
 	}
 }
 
+type MsgPair struct {
+	msg *Message
+	err error
+}
+
 type blockingQueue interface {
 	Push(m *Message) error  // non-blocking.  return an error if it's closed
+	Error(e error) error    // non-blocking.  explicitly push error into the queue
 	Pop() (*Message, error) // block. get error if it is closed while waiting for incoming messages
 	Close()                 // may cause error for push and pop
 }
 
 type unboundedBlockingQueue struct {
 	queue *list.List
-	push  chan *Message
+	push  chan *MsgPair
 	req   chan struct{}
-	res   chan *Message
+	res   chan *MsgPair
 	quit  chan struct{}
 }
 
 func newUnboundedBlockingQueue() blockingQueue {
 	q := &unboundedBlockingQueue{
 		queue: list.New(),
-		push:  make(chan *Message),
+		push:  make(chan *MsgPair),
 		req:   make(chan struct{}),
-		res:   make(chan *Message),
+		res:   make(chan *MsgPair),
 		quit:  make(chan struct{}),
 	}
 
@@ -159,17 +165,17 @@ func (q *unboundedBlockingQueue) start() {
 	}
 }
 
-func (q *unboundedBlockingQueue) popFirst() *Message {
+func (q *unboundedBlockingQueue) popFirst() *MsgPair {
 	front := q.queue.Front()
 	q.queue.Remove(front)
-	return front.Value.(*Message)
+	return front.Value.(*MsgPair)
 }
 
 func (q *unboundedBlockingQueue) Push(m *Message) error {
 	select {
 	case <-q.quit:
 		return fmt.Errorf("blocking queue was closed")
-	case q.push <- m:
+	case q.push <- &MsgPair{m, nil}:
 		return nil
 	}
 }
@@ -187,8 +193,17 @@ func (q *unboundedBlockingQueue) Pop() (*Message, error) {
 		case <-q.quit:
 			return err()
 		case m := <-q.res:
-			return m, nil
+			return m.msg, m.err
 		}
+	}
+}
+
+func (q *unboundedBlockingQueue) Error(e error) error {
+	select {
+	case <-q.quit:
+		return fmt.Errorf("blocking queue was closed")
+	case q.push <- &MsgPair{nil, e}:
+		return nil
 	}
 }
 
