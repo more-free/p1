@@ -31,6 +31,7 @@ func NewRequest(data string, lower, upper uint64) *Message {
 	}
 }
 
+// No task ID encoded : we accept the assumption that a worker only performs one task at a time.
 // New result creates a result message. Miners send result messages to the server
 // and the server sends result messages to clients.
 func NewResult(hash, nonce uint64) *Message {
@@ -57,4 +58,19 @@ func (m *Message) String() string {
 		result = fmt.Sprintf("[%s]", "Join")
 	}
 	return result
+}
+
+// helpers
+func RequestEquals(this, that *Message) bool {
+	return this.Data == that.Data && this.Lower == that.Lower &&
+		this.Upper == that.Upper && this.Type == that.Type
+}
+
+func SubRequest(lower uint64, upper uint64, request *Message) *Message {
+	return &Message{
+		Type:  Request,
+		Data:  request.Data,
+		Lower: lower,
+		Upper: upper,
+	}
 }
