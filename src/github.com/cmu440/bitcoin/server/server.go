@@ -33,33 +33,33 @@ func NewEventParser() impl.EventParser {
 type Server struct {
 	networkManager   impl.NetworkManager
 	workerProxy      impl.WorkerProxy
-	idManager        *impl.IDManager
-	taskStartChan    chan *impl.TaskAssign
-	taskResultChan   chan *impl.TaskResult
+	clients          *bitcoin.IntSet
+	workers          *bitcoin.IntSet
+	taskStartChan    chan *impl.TaskStart
+	taskDoneChan     chan *impl.TaskDone
 	networkEventChan chan *impl.Event
 	quit             chan struct{}
 }
 
 func NewServer(port int, params *lsp.Params) (*Server, error) {
-	taskStartChan := make(chan *impl.TaskAssign)
-	taskResultChan := make(chan *impl.TaskResult)
+	taskStartChan := make(chan *impl.TaskStart)
+	taskDoneChan := make(chan *impl.TaskDone)
 	networkEventChan := make(chan *impl.Event)
 	networkManager, err := impl.NewNetworkManager(port, params, NewEventParser(), networkEventChan)
 	if err != nil {
 		return nil, err
 	}
 
-	mapper := impl.NewFairScheduler()
-	reducer := impl.NewReducer()
-	workerProxy := impl.NewOneForOneWorkerProxy(mapper, reducer, taskStartChan, taskResultChan)
-	idManager := impl.NewIDManager()
+	scheduler := impl.NewFairScheduler()
+	workerProxy := impl.NewWorkerProxy(scheduler, taskStartChan, taskDoneChan)
 
 	return &Server{
 		networkManager:   networkManager,
 		workerProxy:      workerProxy,
-		idManager:        idManager,
+		clients:          bitcoin.NewIntSet(),
+		workers:          bitcoin.NewIntSet(),
 		taskStartChan:    taskStartChan,
-		taskResultChan:   taskResultChan,
+		taskDoneChan:     taskDoneChan,
 		networkEventChan: networkEventChan,
 		quit:             make(chan struct{}),
 	}, nil
@@ -68,23 +68,20 @@ func NewServer(port int, params *lsp.Params) (*Server, error) {
 func (s *Server) Start() {
 	for {
 		select {
-		case taskAssign := <-s.taskStartChan:
-			log.Printf("assign task %v to worker %v", taskAssign.Task.Request, taskAssign.ID)
-			s.write(taskAssign.ID.ToInt(), taskAssign.Task.Request)
+		case taskStart := <-s.taskStartChan:
+			log.Printf("assign task %v to worker %v", taskStart.Request, taskStart.WorkerID)
+			s.write(taskStart.WorkerID, (*bitcoin.Message)(taskStart.Request))
 
-		case taskResult := <-s.taskResultChan:
-			client, err := s.idManager.GetClientByRequest(taskResult.ID.ToInt())
-			// non-nil error indicates a client connection lost, in which case we ignore the result
-			if err == nil {
-				s.write(client, taskResult.Result)
-			}
+		case taskDone := <-s.taskDoneChan:
+			log.Printf("task from client %v was done : %v", taskDone.ClientID, taskDone.Result)
+			s.write(taskDone.ClientID, (*bitcoin.Message)(taskDone.Result))
 
 		case event := <-s.networkEventChan:
 			s.handleNetworkEvent(event)
 
 		case <-s.quit:
 			close(s.taskStartChan)
-			close(s.taskResultChan)
+			close(s.taskDoneChan)
 			return
 		}
 	}
@@ -95,6 +92,7 @@ func (s *Server) Stop() {
 	s.networkManager.Close()
 }
 
+// all event handlers should be non-blocking
 func (s *Server) handleNetworkEvent(event *impl.Event) {
 	switch event.Type {
 	case impl.ClientRequest:
@@ -104,47 +102,44 @@ func (s *Server) handleNetworkEvent(event *impl.Event) {
 		log.Printf("received worker join %v", event.ID)
 		s.handleWorkerJoin(event.ID)
 	case impl.WorkerDone:
-		log.Printf("worker job done %v", event.Msg)
+		log.Printf("worker %v finished subtask %v - %v", event.ID, event.Msg.Id, event.Msg)
 		s.handleWorkerDone(event.ID, event.Msg)
 	case impl.ConnectionLost:
-		log.Printf("connection lost %v", event.ID)
-		s.handleConnectionLost(event.ID, event.Err)
+		log.Printf("connection with %v lost due to error %v", event.ID, event.Err)
+		s.handleConnectionLost(event.ID)
 	}
 }
 
 func (s *Server) handleClientRequest(clientConnID int, req *bitcoin.Message) {
-	requestID := s.idManager.GetUniqueRequestID()
-	s.idManager.AddClientIfAnsent(clientConnID)
-	s.idManager.SetRequestToClient(requestID, clientConnID)
-
-	task := impl.NewTask(impl.ToRequestID(requestID), req)
-	s.workerProxy.Schedule(task)
+	s.clients.Add(clientConnID)
+	s.workerProxy.HandleRequest(req, clientConnID)
 }
 
 func (s *Server) handleWorkerJoin(workerConnID int) {
-	s.idManager.AddWorkerIfAbsent(workerConnID)
-	s.workerProxy.HandleWorkerJoin(impl.ToWorkerID(workerConnID))
+	s.workers.Add(workerConnID)
+	s.workerProxy.HandleWorkerJoin(workerConnID)
 }
 
 func (s *Server) handleWorkerDone(workerConnID int, res *bitcoin.Message) {
-	partialResult := impl.NewTaskPartialResult(impl.ToWorkerID(workerConnID), res)
-	s.workerProxy.HandlePartialResult(partialResult)
+	s.workerProxy.HandleResult(impl.Result(res), workerConnID)
 }
 
-func (s *Server) handleConnectionLost(connID int, cause error) {
-	if s.idManager.IsClient(connID) {
-		s.idManager.RemoveClient(connID)
-	} else { // workerID
-		s.idManager.RemoveWorker(connID)
-		s.workerProxy.HandleWorkerLost(impl.ToWorkerID(connID))
+func (s *Server) handleConnectionLost(connID int) {
+	if s.clients.Contains(connID) {
+		s.clients.Remove(connID)
+	} else if s.workers.Contains(connID) {
+		s.workers.Remove(connID)
+		s.workerProxy.HandleWorkerLost(connID)
+	} else {
+		// ignore non-existing ids
 	}
 }
 
 func (s *Server) write(connID int, msg *bitcoin.Message) {
 	err := s.networkManager.Send(connID, msg)
 	if err != nil {
-		log.Printf("failed to send message to %v : %v", connID, err)
-		s.handleConnectionLost(connID, err)
+		log.Printf("failed to send message to client/worker %v due to error %v", connID, err)
+		s.handleConnectionLost(connID)
 	}
 }
 

@@ -34,6 +34,10 @@ func (s *IntSet) Keys() []int {
 	return keys
 }
 
+func (s *IntSet) Len() int {
+	return len(s.set)
+}
+
 func (m *Message) ToBytes() ([]byte, error) {
 	return json.Marshal(m)
 }

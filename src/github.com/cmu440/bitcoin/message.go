@@ -1,5 +1,10 @@
 package bitcoin
 
+/*
+modified a little bit for the original structures :
+add ID field to Result message
+*/
+
 import "fmt"
 
 type MsgType int
@@ -14,6 +19,7 @@ const (
 // mining distributed system. Messages must be marshalled into a byte slice before being
 // sent over the network.
 type Message struct {
+	Id           int
 	Type         MsgType
 	Data         string
 	Lower, Upper uint64
@@ -31,11 +37,14 @@ func NewRequest(data string, lower, upper uint64) *Message {
 	}
 }
 
-// No task ID encoded : we accept the assumption that a worker only performs one task at a time.
+// result ID is encoded to let the server identify which request it belongs to.
+// when result is sent from miner to server, the id indicates a unique subtask id
+// storing on the server side.
 // New result creates a result message. Miners send result messages to the server
 // and the server sends result messages to clients.
-func NewResult(hash, nonce uint64) *Message {
+func NewResult(id int, hash, nonce uint64) *Message {
 	return &Message{
+		Id:    id,
 		Type:  Result,
 		Hash:  hash,
 		Nonce: nonce,

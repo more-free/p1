@@ -3,11 +3,18 @@ package server
 import (
 	"github.com/cmu440/bitcoin"
 	"log"
+	"math"
 )
+
+type Assign struct {
+	workerID int
+	request  Request
+}
 
 // a simple stateful scheduler interface
 type Scheduler interface {
-	GetAssignment(task *Task, rt map[WorkerID]WorkerRunTime) []*TaskAssign // it splits a task to multiple TaskAssign
+	Map(request Request, rt RuntimeMap) []*Assign
+	Reduce(subresults []Result) Result
 }
 
 // a simple scheduler which splits tasks based on worker efficiency (task/time),
@@ -19,8 +26,58 @@ func NewFairScheduler() Scheduler {
 	return &FairScheduler{}
 }
 
-func (s *FairScheduler) getTaskRatioByEfficiency(rts map[WorkerID]WorkerRunTime) map[WorkerID]float32 {
-	ratio := make(map[WorkerID]float32)
+func (s *FairScheduler) Map(req Request, rts RuntimeMap) []*Assign {
+	assignments := make([]*Assign, 0)
+	if len(rts) == 0 {
+		return assignments
+	}
+
+	totalWorkLoad := req.Upper - req.Lower
+	efficiencyRatio := s.getTaskRatioByEfficiency(rts)
+	log.Println("current efficiency ratio :", efficiencyRatio)
+
+	// assign to the first n - 1 out of n with regards to their efficiency scores
+	workers := make([]int, 0)
+	for id, _ := range rts {
+		workers = append(workers, id)
+	}
+
+	lower := req.Lower
+	for _, id := range workers[:len(workers)-1] {
+		ratio := efficiencyRatio[id]
+		workload := uint64(float32(totalWorkLoad) * ratio)
+		upper := lower + workload - 1
+
+		assign := &Assign{id, bitcoin.SubRequest(lower, upper, req)}
+		assignments = append(assignments, assign)
+		lower = upper + 1
+	}
+
+	// assign the remaining workload to the last worker
+	assign := &Assign{workers[len(workers)-1], bitcoin.SubRequest(lower, req.Upper, req)}
+	assignments = append(assignments, assign)
+
+	s.printAssignments(assignments)
+	return assignments
+}
+
+func (s *FairScheduler) Reduce(res []Result) Result {
+	var nonce uint64
+	var minHash uint64 = math.MaxUint64
+
+	for _, r := range res {
+		if r.Hash < minHash {
+			minHash = r.Hash
+			nonce = r.Nonce
+		}
+	}
+
+	// the ID field doesn't matter when it is sent from server to client
+	return (Result)(bitcoin.NewResult(0, minHash, nonce))
+}
+
+func (s *FairScheduler) getTaskRatioByEfficiency(rts map[int]WorkerRunTime) map[int]float32 {
+	ratio := make(map[int]float32)
 
 	// case 1, if all workers are new, return a even ratio
 	allZero := true
@@ -65,44 +122,8 @@ func (s *FairScheduler) getTaskRatioByEfficiency(rts map[WorkerID]WorkerRunTime)
 	return ratio
 }
 
-func (s *FairScheduler) GetAssignment(task *Task, rts map[WorkerID]WorkerRunTime) []*TaskAssign {
-	assignments := make([]*TaskAssign, 0)
-	if len(rts) == 0 {
-		return assignments
-	}
-
-	requestID := task.ID
-	totalWorkLoad := task.Request.Upper - task.Request.Lower
-	efficiencyRatio := s.getTaskRatioByEfficiency(rts)
-	log.Println("current efficiency ratio :", efficiencyRatio)
-
-	// assign to the first n - 1 out of n with regards to their efficiency scores
-	workers := make([]WorkerID, 0)
-	for id, _ := range rts {
-		workers = append(workers, id)
-	}
-
-	lower := task.Request.Lower
-	for _, id := range workers[:len(workers)-1] {
-		ratio := efficiencyRatio[id]
-		workload := uint64(float32(totalWorkLoad) * ratio)
-		upper := lower + workload - 1
-		assign := NewTaskAssign(id, NewTask(requestID, bitcoin.SubRequest(lower, upper, task.Request)))
-		assignments = append(assignments, assign)
-		lower = upper + 1
-	}
-
-	// assign the remaining workload to the last worker
-	assign := NewTaskAssign(workers[len(workers)-1],
-		NewTask(requestID, bitcoin.SubRequest(lower, task.Request.Upper, task.Request)))
-	assignments = append(assignments, assign)
-
-	s.printAssignments(assignments)
-	return assignments
-}
-
-func (s *FairScheduler) printAssignments(assignments []*TaskAssign) {
+func (s *FairScheduler) printAssignments(assignments []*Assign) {
 	for _, assign := range assignments {
-		log.Println(assign.ID, " <- ", assign.Task.Request)
+		log.Println(assign.workerID, " <- ", assign.request)
 	}
 }

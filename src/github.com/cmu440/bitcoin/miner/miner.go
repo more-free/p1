@@ -69,7 +69,7 @@ func (m *Miner) handleRequest(req *bitcoin.Message) {
 			}
 		}
 
-		m.write(bitcoin.NewResult(minHash, nonce))
+		m.write(bitcoin.NewResult(req.Id, minHash, nonce))
 	}()
 }
 
