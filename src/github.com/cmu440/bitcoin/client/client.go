@@ -11,7 +11,6 @@ import (
 
 type Client struct {
 	client lsp.Client
-	inMsg  chan *bitcoin.Message // incoming messages
 	done   chan bool
 }
 
@@ -23,7 +22,6 @@ func NewClient(hostport string, params *lsp.Params, done chan bool) (*Client, er
 
 	c := &Client{
 		client: client,
-		inMsg:  make(chan *bitcoin.Message),
 		done:   done,
 	}
 
@@ -36,6 +34,7 @@ func (c *Client) Start() {
 			data, err := c.client.Read()
 			if err != nil {
 				log.Printf("quit client due to %v", err)
+				printDisconnected()
 				break
 			}
 
@@ -46,9 +45,9 @@ func (c *Client) Start() {
 			}
 
 			c.handleMessage(msg)
+			break
 		}
 
-		printDisconnected()
 		c.done <- true
 	}()
 }

@@ -14,7 +14,7 @@ type IDManager struct {
 
 func NewIDManager() *IDManager {
 	return &IDManager{
-		nextRequestID:   0,
+		nextRequestID:   1,
 		requestToClient: make(map[int]int),
 		clientIDs:       bitcoin.NewIntSet(),
 		workerIDs:       bitcoin.NewIntSet(),

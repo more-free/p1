@@ -3,15 +3,34 @@ package server
 // TODO add stat and runtime to maintain worker metadata, stat, runtime info (dynamic), etc.
 // these parameters can be used as input of the scheduler. Accordingly, scheduler should be
 // stateless
+// TODO if we are allowed to modify the structure of messages, this part can be much simpler (ex. adding an id
+// to a message may eliminate most structures defined in this file)
 
 import (
 	"container/list"
 	"fmt"
 	"github.com/cmu440/bitcoin"
+	"time"
 )
 
 type RequestID int
 type WorkerID int
+
+func ToRequestID(id int) RequestID {
+	return RequestID(id)
+}
+
+func ToWorkerID(id int) WorkerID {
+	return WorkerID(id)
+}
+
+func (i RequestID) ToInt() int {
+	return int(i)
+}
+
+func (i WorkerID) ToInt() int {
+	return int(i)
+}
 
 // a task is a unique request ID + a request message (might be a sub-requests divided by scheduler,
 // which have the same request ID)
@@ -170,6 +189,69 @@ func (t *RequestTable) RemoveTaskAssign(id RequestID, taskAssign *TaskAssign) {
 	t.requests[id].Remove(taskAssign)
 }
 
+func (t *RequestTable) RemoveAllTaskAssign(id WorkerID) {
+	for _, rs := range t.requests {
+		rs.RemoveTaskAssignByID(id)
+	}
+}
+
+/*
+This interface will be used by the scheduler to achieve a fair strategy
+*/
+type WorkerRunTime interface {
+	WorkLoad() float32
+	SetWorkLoad(float32)
+	WorkTime() int64
+	SetWorkTime(int64)
+
+	// add later
+	// StartTime() time.Time
+	// RunningTime() time.Duration
+	// CPU() float32
+	// Memory() float32
+	// DiskIO() float32
+	// NetworkIO() float32
+}
+
+// a naive implementation used for bit miner only
+type WorkerHistory struct {
+	workLoad    float32 // accumulated upper - lower
+	workTime    int64   // nano seconds
+	lastStarted time.Time
+}
+
+func NewWorkerHistory() *WorkerHistory {
+	return &WorkerHistory{
+		workLoad: 0.0,
+		workTime: 0,
+	}
+}
+
+// note it may return 0 for newly joined workers
+func (w *WorkerHistory) WorkLoad() float32 {
+	return w.workLoad
+}
+
+func (w *WorkerHistory) SetWorkLoad(wl float32) {
+	w.workLoad = wl
+}
+
+func (w *WorkerHistory) WorkTime() int64 {
+	return w.workTime
+}
+
+func (w *WorkerHistory) SetWorkTime(wt int64) {
+	w.workTime = wt
+}
+
+func (w *WorkerHistory) setLastStartTime(st time.Time) {
+	w.lastStarted = st
+}
+
+func (w *WorkerHistory) getLastStartTime() time.Time {
+	return w.lastStarted
+}
+
 /*
 Due to the limit of pre-defined messages, we assume that
 at anytime a worker is only working on one task, so that we don't need to explicitly encode task id to Request
@@ -209,6 +291,7 @@ type OneForOneWorkerProxy struct {
 	reducer      Reducer
 	taskTable    *TaskTable
 	requestTable *RequestTable
+	runtime      map[WorkerID]*WorkerHistory
 	taskToStart  chan<- *TaskAssign
 	taskResult   chan<- *TaskResult
 	pendingTask  *TaskQueue // pending requests due to no connected worker
@@ -221,10 +304,23 @@ func NewOneForOneWorkerProxy(mapper Scheduler, reducer Reducer,
 		reducer:      reducer,
 		taskTable:    NewTaskTable(),
 		requestTable: NewRequestTable(),
+		runtime:      make(map[WorkerID]*WorkerHistory),
 		taskToStart:  taskToStart,
 		taskResult:   taskResult,
 		pendingTask:  NewTaskQueue(),
 	}
+}
+
+func (w *OneForOneWorkerProxy) notifyTaskStart(assign *TaskAssign) {
+	go func() {
+		w.taskToStart <- assign
+	}()
+}
+
+func (w *OneForOneWorkerProxy) notifyTaskDone(result *TaskResult) {
+	go func() {
+		w.taskResult <- result
+	}()
 }
 
 /*
@@ -236,23 +332,48 @@ func (w *OneForOneWorkerProxy) Schedule(newTask *Task) {
 		return
 	}
 
-	assignments := w.mapper.GetAssignment(newTask)
+	assignments := w.mapper.GetAssignment(newTask, w.getRuntimeMap())
 
 	// update request table
 	for _, assign := range assignments {
-		w.requestTable.AddTaskAssign(assign.Task.ID, assign)
+		requestID := assign.Task.ID
+		w.requestTable.AddTaskAssign(requestID, assign)
 	}
 
 	// update task table
 	for _, assign := range assignments {
-		w.taskTable.AddTask(assign.ID, assign.Task)
+		workerID := assign.ID
+		w.taskTable.AddTask(workerID, assign.Task)
 
 		// if no other running tasks, notify the taskToStart channel
-		if w.taskTable.GetTaskQueue(assign.ID).Len() == 1 {
-			w.taskToStart <- assign
-			w.mapper.SetTaskStarted(assign.ID, assign.Task)
+		if w.taskTable.GetTaskQueue(workerID).Len() == 1 {
+			w.notifyTaskStart(assign)
+			w.runtime[workerID].setLastStartTime(time.Now())
 		}
 	}
+}
+
+func (w *OneForOneWorkerProxy) getRuntimeMap() map[WorkerID]WorkerRunTime {
+	rts := make(map[WorkerID]WorkerRunTime)
+	for id, rt := range w.runtime {
+		rts[id] = rt
+	}
+	return rts
+}
+
+func (w *OneForOneWorkerProxy) addWorkerRuntime(id WorkerID) {
+	w.runtime[id] = NewWorkerHistory()
+}
+
+func (w *OneForOneWorkerProxy) removeWorkerRuntime(id WorkerID) {
+	delete(w.runtime, id)
+}
+
+func (w *OneForOneWorkerProxy) updateWorkerRuntime(id WorkerID, taskFinished *Task) {
+	rt := w.runtime[id]
+	rt.SetWorkLoad(rt.WorkLoad() + float32(taskFinished.Request.Upper-taskFinished.Request.Lower))
+	duration := time.Since(rt.getLastStartTime()).Nanoseconds()
+	rt.SetWorkTime(rt.WorkTime() + duration)
 }
 
 func (w *OneForOneWorkerProxy) getWorkerSize() int {
@@ -265,36 +386,34 @@ func (w *OneForOneWorkerProxy) HandlePartialResult(partialResult *TaskPartialRes
 	finishedTask, _ := w.taskTable.PopTask(workerID)
 	requestID := finishedTask.ID
 
-	// update stateful scheduler
-	w.mapper.SetTaskFinished(workerID, finishedTask)
+	w.updateWorkerRuntime(workerID, finishedTask)
 
 	// set result for request table
 	w.requestTable.AddTaskResult(requestID, partialResult)
 
 	// send message to taskResult channel if all sub-tasks of the request have been finished
 	if len(w.requestTable.GetTaskAssign(requestID)) == len(w.requestTable.GetTaskResult(requestID)) {
+		result := w.reducer(w.requestTable.GetTaskResult(requestID), requestID)
+		w.notifyTaskDone(result)
 		w.requestTable.RemoveRequest(requestID)
-		w.taskResult <- w.reducer(w.requestTable.GetTaskResult(requestID), requestID)
 	}
 
 	// update task table by starting the next task of workerID
 	newTask, err := w.taskTable.GetTopTask(workerID)
 	if err == nil { // if it has task left, start it
-		w.taskToStart <- NewTaskAssign(workerID, newTask)
+		w.notifyTaskStart(NewTaskAssign(workerID, newTask))
 	}
 }
 
 // it re-assigns all tasks belonging to the failed worker to other workers
 func (w *OneForOneWorkerProxy) HandleWorkerLost(id WorkerID) {
-	w.mapper.RemoveWorker(id)
+	w.removeWorkerRuntime(id)
 
 	failedTasks := w.taskTable.GetTaskQueue(id).GetAll()
 	w.taskTable.RemoveWorker(id)
 
 	// remove failed tasks from request table
-	for _, failedTask := range failedTasks {
-		w.requestTable.RemoveTaskAssign(failedTask.ID, NewTaskAssign(id, failedTask))
-	}
+	w.requestTable.RemoveAllTaskAssign(id)
 
 	// reschedule failed tasks
 	for _, failedTask := range failedTasks {
@@ -303,7 +422,7 @@ func (w *OneForOneWorkerProxy) HandleWorkerLost(id WorkerID) {
 }
 
 func (w *OneForOneWorkerProxy) HandleWorkerJoin(id WorkerID) {
-	w.mapper.AddWorker(id)
+	w.addWorkerRuntime(id)
 	w.taskTable.AddWorker(id)
 
 	for {
@@ -433,4 +552,13 @@ func (t *TaskAssignSet) GetAllResult() []*TaskPartialResult {
 		}
 	}
 	return results
+}
+
+func (t *TaskAssignSet) RemoveTaskAssignByID(id WorkerID) {
+	for e := t.set.Front(); e != nil; e = e.Next() {
+		workerID := e.Value.(*assignAndResult).assign.ID
+		if workerID == id {
+			t.set.Remove(e)
+		}
+	}
 }

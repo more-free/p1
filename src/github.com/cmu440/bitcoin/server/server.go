@@ -30,103 +30,57 @@ func NewEventParser() impl.EventParser {
 	}
 }
 
-func NewEventHandler(s *Handler) impl.EventHandler {
-	return func(event *impl.Event) {
-		switch event.Type {
-		case impl.ClientRequest:
-			s.HandleClientRequest(event.ID, event.Msg)
-		case impl.WorkerJoin:
-			s.HandleWorkerJoin(event.ID)
-		case impl.WorkerDone:
-			s.HandleWorkerDone(event.ID, event.Msg)
-		case impl.ConnectionLost:
-			s.HandleConnectionLost(event.ID, event.Err)
-		}
-	}
-}
-
-type Handler struct {
-	workerProxy impl.WorkerProxy
-	*impl.IDManager
-}
-
-func NewHandler(taskToStart chan<- *impl.TaskAssign, taskResult chan<- *impl.TaskResult) *Handler {
-	mapper := impl.NewFairScheduler()
-	reducer := impl.NewReducer()
-	return &Handler{
-		impl.NewOneForOneWorkerProxy(mapper, reducer, taskToStart, taskResult),
-		impl.NewIDManager(),
-	}
-}
-
-func (s *Handler) HandleClientRequest(clientConnID int, req *bitcoin.Message) {
-	requestID := s.GetUniqueRequestID()
-	s.AddClientIfAnsent(clientConnID)
-	s.SetRequestToClient(requestID, clientConnID)
-
-	task := impl.NewTask(impl.RequestID(requestID), req)
-	s.workerProxy.Schedule(task)
-}
-
-func (s *Handler) HandleWorkerJoin(workerConnID int) {
-	s.AddWorkerIfAbsent(workerConnID)
-	s.workerProxy.HandleWorkerJoin(impl.WorkerID(workerConnID))
-}
-
-func (s *Handler) HandleWorkerDone(workerConnID int, res *bitcoin.Message) {
-	partialResult := impl.NewTaskPartialResult(impl.WorkerID(workerConnID), res)
-	s.workerProxy.HandlePartialResult(partialResult)
-}
-
-func (s *Handler) HandleConnectionLost(connID int, cause error) {
-	if s.IsClient(connID) {
-		s.RemoveClient(connID)
-	} else { // workerID
-		s.RemoveWorker(connID)
-		s.workerProxy.HandleWorkerLost(impl.WorkerID(connID))
-	}
-}
-
 type Server struct {
-	networkManager impl.NetworkManager
-	handler        *Handler
-	taskStartChan  chan *impl.TaskAssign
-	taskResultChan chan *impl.TaskResult
-	quit           chan struct{}
+	networkManager   impl.NetworkManager
+	workerProxy      impl.WorkerProxy
+	idManager        *impl.IDManager
+	taskStartChan    chan *impl.TaskAssign
+	taskResultChan   chan *impl.TaskResult
+	networkEventChan chan *impl.Event
+	quit             chan struct{}
 }
 
 func NewServer(port int, params *lsp.Params) (*Server, error) {
 	taskStartChan := make(chan *impl.TaskAssign)
 	taskResultChan := make(chan *impl.TaskResult)
-	handler := NewHandler(taskStartChan, taskResultChan)
-	networkManager, err := impl.NewNetworkManager(port, params, NewEventHandler(handler), NewEventParser())
+	networkEventChan := make(chan *impl.Event)
+	networkManager, err := impl.NewNetworkManager(port, params, NewEventParser(), networkEventChan)
 	if err != nil {
 		return nil, err
 	}
 
-	server := &Server{
-		networkManager: networkManager,
-		handler:        handler,
-		taskStartChan:  taskStartChan,
-		taskResultChan: taskResultChan,
-		quit:           make(chan struct{}),
-	}
+	mapper := impl.NewFairScheduler()
+	reducer := impl.NewReducer()
+	workerProxy := impl.NewOneForOneWorkerProxy(mapper, reducer, taskStartChan, taskResultChan)
+	idManager := impl.NewIDManager()
 
-	return server, nil
+	return &Server{
+		networkManager:   networkManager,
+		workerProxy:      workerProxy,
+		idManager:        idManager,
+		taskStartChan:    taskStartChan,
+		taskResultChan:   taskResultChan,
+		networkEventChan: networkEventChan,
+		quit:             make(chan struct{}),
+	}, nil
 }
 
 func (s *Server) Start() {
 	for {
 		select {
 		case taskAssign := <-s.taskStartChan:
-			s.write(int(taskAssign.ID), taskAssign.Task.Request)
+			log.Printf("assign task %v to worker %v", taskAssign.Task.Request, taskAssign.ID)
+			s.write(taskAssign.ID.ToInt(), taskAssign.Task.Request)
 
 		case taskResult := <-s.taskResultChan:
-			client, err := s.handler.GetClientByRequest(int(taskResult.ID))
-			// non-nil error indicates client connection lost, in that case we ignore the result
+			client, err := s.idManager.GetClientByRequest(taskResult.ID.ToInt())
+			// non-nil error indicates a client connection lost, in which case we ignore the result
 			if err == nil {
 				s.write(client, taskResult.Result)
 			}
+
+		case event := <-s.networkEventChan:
+			s.handleNetworkEvent(event)
 
 		case <-s.quit:
 			close(s.taskStartChan)
@@ -136,17 +90,62 @@ func (s *Server) Start() {
 	}
 }
 
+func (s *Server) Stop() {
+	close(s.quit)
+	s.networkManager.Close()
+}
+
+func (s *Server) handleNetworkEvent(event *impl.Event) {
+	switch event.Type {
+	case impl.ClientRequest:
+		log.Printf("received client request %v from %v", event.Msg, event.ID)
+		s.handleClientRequest(event.ID, event.Msg)
+	case impl.WorkerJoin:
+		log.Printf("received worker join %v", event.ID)
+		s.handleWorkerJoin(event.ID)
+	case impl.WorkerDone:
+		log.Printf("worker job done %v", event.Msg)
+		s.handleWorkerDone(event.ID, event.Msg)
+	case impl.ConnectionLost:
+		log.Printf("connection lost %v", event.ID)
+		s.handleConnectionLost(event.ID, event.Err)
+	}
+}
+
+func (s *Server) handleClientRequest(clientConnID int, req *bitcoin.Message) {
+	requestID := s.idManager.GetUniqueRequestID()
+	s.idManager.AddClientIfAnsent(clientConnID)
+	s.idManager.SetRequestToClient(requestID, clientConnID)
+
+	task := impl.NewTask(impl.ToRequestID(requestID), req)
+	s.workerProxy.Schedule(task)
+}
+
+func (s *Server) handleWorkerJoin(workerConnID int) {
+	s.idManager.AddWorkerIfAbsent(workerConnID)
+	s.workerProxy.HandleWorkerJoin(impl.ToWorkerID(workerConnID))
+}
+
+func (s *Server) handleWorkerDone(workerConnID int, res *bitcoin.Message) {
+	partialResult := impl.NewTaskPartialResult(impl.ToWorkerID(workerConnID), res)
+	s.workerProxy.HandlePartialResult(partialResult)
+}
+
+func (s *Server) handleConnectionLost(connID int, cause error) {
+	if s.idManager.IsClient(connID) {
+		s.idManager.RemoveClient(connID)
+	} else { // workerID
+		s.idManager.RemoveWorker(connID)
+		s.workerProxy.HandleWorkerLost(impl.ToWorkerID(connID))
+	}
+}
+
 func (s *Server) write(connID int, msg *bitcoin.Message) {
 	err := s.networkManager.Send(connID, msg)
 	if err != nil {
 		log.Printf("failed to send message to %v : %v", connID, err)
-		s.handler.HandleConnectionLost(connID, err)
+		s.handleConnectionLost(connID, err)
 	}
-}
-
-func (s *Server) Stop() {
-	close(s.quit)
-	s.networkManager.Close()
 }
 
 func main() {

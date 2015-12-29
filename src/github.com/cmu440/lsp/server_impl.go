@@ -142,7 +142,7 @@ func (s *server) listen() {
 
 		case id := <-s.handlerStop: // handler epoch timeout, lspRunner has already stopped
 			s.removeHandler(id)
-			s.in.Error(fmt.Errorf("client %v connection closed", id))
+			s.in.Error(fmt.Errorf("client %v connection closed", id), WrapperMsg(EmptyPayload(), id))
 		case <-s.quit:
 			return
 		}
@@ -222,7 +222,7 @@ func (s *server) startHandler(connId int, handler *clientHandler) {
 			if err == nil {
 				s.in.Push(WrapperMsg(payload, connId))
 			} else {
-				break
+				break // onStop callback will be invoked
 			}
 		}
 	}()
@@ -238,7 +238,7 @@ func (s *server) handleDataAck(dataAck *inMsg) {
 func (s *server) Read() (int, []byte, error) {
 	msg, err := s.in.Pop()
 	if err != nil {
-		return -1, EmptyPayload(), err
+		return msg.ConnID, EmptyPayload(), err
 	} else {
 		return msg.ConnID, msg.Payload, nil
 	}

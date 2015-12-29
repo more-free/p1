@@ -18,27 +18,27 @@ type NetworkManager interface {
 }
 
 type networkManager struct {
-	port    int
-	params  *lsp.Params
-	server  lsp.Server
-	handler EventHandler
-	parser  EventParser
-	closed  bool
+	port      int
+	params    *lsp.Params
+	server    lsp.Server
+	parser    EventParser
+	eventChan chan<- *Event // publish network-level event to high-level server
+	closed    bool
 }
 
-func NewNetworkManager(port int, params *lsp.Params, handler EventHandler, parser EventParser) (NetworkManager, error) {
+func NewNetworkManager(port int, params *lsp.Params, parser EventParser, eventChan chan<- *Event) (NetworkManager, error) {
 	server, err := lsp.NewServer(port, params)
 	if err != nil {
 		return &networkManager{}, err
 	}
 
 	manager := &networkManager{
-		port:    port,
-		params:  params,
-		server:  server,
-		handler: handler,
-		parser:  parser,
-		closed:  false,
+		port:      port,
+		params:    params,
+		server:    server,
+		parser:    parser,
+		eventChan: eventChan,
+		closed:    false,
 	}
 
 	go manager.start()
@@ -54,7 +54,7 @@ func (w *networkManager) start() {
 		}
 
 		event := w.parser(id, payload, err)
-		w.handler(event)
+		w.eventChan <- event
 	}
 }
 

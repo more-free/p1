@@ -116,10 +116,10 @@ type MsgPair struct {
 }
 
 type blockingQueue interface {
-	Push(m *Message) error  // non-blocking.  return an error if it's closed
-	Error(e error) error    // non-blocking.  explicitly push error into the queue
-	Pop() (*Message, error) // block. get error if it is closed while waiting for incoming messages
-	Close()                 // may cause error for push and pop
+	Push(m *Message) error           // non-blocking.  return an error if it's closed
+	Error(e error, m *Message) error // non-blocking.  explicitly push error into the queue
+	Pop() (*Message, error)          // block. get error if it is closed while waiting for incoming messages
+	Close()                          // may cause error for push and pop
 }
 
 type unboundedBlockingQueue struct {
@@ -198,11 +198,12 @@ func (q *unboundedBlockingQueue) Pop() (*Message, error) {
 	}
 }
 
-func (q *unboundedBlockingQueue) Error(e error) error {
+// msg is optional
+func (q *unboundedBlockingQueue) Error(e error, msg *Message) error {
 	select {
 	case <-q.quit:
 		return fmt.Errorf("blocking queue was closed")
-	case q.push <- &MsgPair{nil, e}:
+	case q.push <- &MsgPair{msg, e}:
 		return nil
 	}
 }
