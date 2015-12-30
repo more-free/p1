@@ -70,11 +70,11 @@ func (s *Server) Start() {
 		select {
 		case taskStart := <-s.taskStartChan:
 			log.Printf("assign task %v to worker %v", taskStart.Request, taskStart.WorkerID)
-			s.write(taskStart.WorkerID, (*bitcoin.Message)(taskStart.Request))
+			s.write(taskStart.WorkerID, taskStart.Request)
 
 		case taskDone := <-s.taskDoneChan:
 			log.Printf("task from client %v was done : %v", taskDone.ClientID, taskDone.Result)
-			s.write(taskDone.ClientID, (*bitcoin.Message)(taskDone.Result))
+			s.write(taskDone.ClientID, taskDone.Result)
 
 		case event := <-s.networkEventChan:
 			s.handleNetworkEvent(event)
@@ -102,7 +102,7 @@ func (s *Server) handleNetworkEvent(event *impl.Event) {
 		log.Printf("received worker join %v", event.ID)
 		s.handleWorkerJoin(event.ID)
 	case impl.WorkerDone:
-		log.Printf("worker %v finished subtask %v - %v", event.ID, event.Msg.Id, event.Msg)
+		log.Printf("worker %v finished subtask %v - %v", event.ID, event.Msg.GetID(), event.Msg)
 		s.handleWorkerDone(event.ID, event.Msg)
 	case impl.ConnectionLost:
 		log.Printf("connection with %v lost due to error %v", event.ID, event.Err)
@@ -121,7 +121,7 @@ func (s *Server) handleWorkerJoin(workerConnID int) {
 }
 
 func (s *Server) handleWorkerDone(workerConnID int, res *bitcoin.Message) {
-	s.workerProxy.HandleResult(impl.Result(res), workerConnID)
+	s.workerProxy.HandleResult(res, workerConnID)
 }
 
 func (s *Server) handleConnectionLost(connID int) {

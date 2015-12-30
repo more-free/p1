@@ -8,13 +8,13 @@ import (
 
 type Assign struct {
 	workerID int
-	request  Request
+	request  *bitcoin.Message
 }
 
 // a simple stateful scheduler interface
 type Scheduler interface {
-	Map(request Request, rt RuntimeMap) []*Assign
-	Reduce(subresults []Result) Result
+	Map(request *bitcoin.Message, rt RuntimeMap) []*Assign
+	Reduce(subresults []*bitcoin.Message) *bitcoin.Message
 }
 
 // a simple scheduler which splits tasks based on worker efficiency (task/time),
@@ -26,7 +26,7 @@ func NewFairScheduler() Scheduler {
 	return &FairScheduler{}
 }
 
-func (s *FairScheduler) Map(req Request, rts RuntimeMap) []*Assign {
+func (s *FairScheduler) Map(req *bitcoin.Message, rts RuntimeMap) []*Assign {
 	assignments := make([]*Assign, 0)
 	if len(rts) == 0 {
 		return assignments
@@ -61,7 +61,7 @@ func (s *FairScheduler) Map(req Request, rts RuntimeMap) []*Assign {
 	return assignments
 }
 
-func (s *FairScheduler) Reduce(res []Result) Result {
+func (s *FairScheduler) Reduce(res []*bitcoin.Message) *bitcoin.Message {
 	var nonce uint64
 	var minHash uint64 = math.MaxUint64
 
@@ -72,8 +72,7 @@ func (s *FairScheduler) Reduce(res []Result) Result {
 		}
 	}
 
-	// the ID field doesn't matter when it is sent from server to client
-	return (Result)(bitcoin.NewResult(0, minHash, nonce))
+	return bitcoin.NewResult(minHash, nonce)
 }
 
 func (s *FairScheduler) getTaskRatioByEfficiency(rts map[int]WorkerRunTime) map[int]float32 {

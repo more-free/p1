@@ -8,34 +8,31 @@ import (
 	"time"
 )
 
-type Request *bitcoin.Message
-type Result *bitcoin.Message // partial result
-
 type RuntimeMap map[int]WorkerRunTime
 
 type TaskStart struct {
 	WorkerID int
-	Request  Request
+	Request  *bitcoin.Message
 }
 
 type TaskDone struct {
 	ClientID int
-	Result   Result // global result
+	Result   *bitcoin.Message // global result
 }
 
 type Task struct {
-	ID        int             // unique task id
-	ClientID  int             // client conn ID
-	ParentID  int             // parent task id, or -1 if no parent task
-	WorkerID  int             // assigned to which worker, or -1 if not assigned as a whole
-	Request   Request         // the request message
-	Result    Result          // the result message
-	Subtasks  *bitcoin.IntSet // empty if no sub-task
+	ID        int              // unique task id
+	ClientID  int              // client conn ID
+	ParentID  int              // parent task id, or -1 if no parent task
+	WorkerID  int              // assigned to which worker, or -1 if not assigned as a whole
+	Request   *bitcoin.Message // the request message
+	Result    *bitcoin.Message // the result message
+	Subtasks  *bitcoin.IntSet  // empty if no sub-task
 	StartTime time.Time
 	StopTime  time.Time
 }
 
-func NewParentTask(id int, clientID int, req Request) *Task {
+func NewParentTask(id int, clientID int, req *bitcoin.Message) *Task {
 	return &Task{
 		ID:       id,
 		ClientID: clientID,
@@ -47,7 +44,7 @@ func NewParentTask(id int, clientID int, req Request) *Task {
 	}
 }
 
-func NewSubTask(id int, clientID int, parentID int, workerID int, req Request) *Task {
+func NewSubTask(id int, clientID int, parentID int, workerID int, req *bitcoin.Message) *Task {
 	return &Task{
 		ID:       id,
 		ClientID: clientID,
@@ -75,7 +72,7 @@ func (t *Task) AddSubTask(id int) {
 	t.Subtasks.Add(id)
 }
 
-func (t *Task) AddResult(res Result) {
+func (t *Task) AddResult(res *bitcoin.Message) {
 	t.Result = res
 }
 
@@ -153,8 +150,8 @@ func (w *WorkerHistory) SetWorkTime(wt int64) {
 }
 
 type WorkerProxy interface {
-	HandleRequest(req Request, clientID int)
-	HandleResult(res Result, workerID int)
+	HandleRequest(req *bitcoin.Message, clientID int)
+	HandleResult(res *bitcoin.Message, workerID int)
 	HandleWorkerLost(workerID int) // connection lost or any failure
 	HandleWorkerJoin(workerID int)
 }
@@ -181,11 +178,11 @@ func NewWorkerProxy(scheduler Scheduler, taskStartChan chan<- *TaskStart, taskDo
 	}
 }
 
-func (w *workerProxy) HandleRequest(req Request, clientID int) {
+func (w *workerProxy) HandleRequest(req *bitcoin.Message, clientID int) {
 	w.handleRequest(req, clientID, -1)
 }
 
-func (w *workerProxy) handleRequest(req Request, clientID int, parentID int) {
+func (w *workerProxy) handleRequest(req *bitcoin.Message, clientID int, parentID int) {
 	if w.getWorkerSize() == 0 {
 		w.pendingReq.Push(req, clientID)
 		return
@@ -204,7 +201,7 @@ func (w *workerProxy) handleRequest(req Request, clientID int, parentID int) {
 	assigns := w.scheduler.Map(req, w.runtime)
 	for _, assign := range assigns {
 		subid := w.getNextTaskID()
-		assign.request.Id = subid
+		assign.request.SetID(subid)
 		subtask := NewSubTask(subid, clientID, parentID, assign.workerID, assign.request)
 		w.addTask(subid, subtask)
 		parentTask.AddSubTask(subid)
@@ -215,8 +212,8 @@ func (w *workerProxy) handleRequest(req Request, clientID int, parentID int) {
 	w.sendRequest(subtasks)
 }
 
-func (w *workerProxy) HandleResult(res Result, workerID int) {
-	subid := res.Id
+func (w *workerProxy) HandleResult(res *bitcoin.Message, workerID int) {
+	subid := res.GetID()
 
 	// ignore non-existing task result. this may be caused by a worker connection lost :
 	// imagine a worker gets a request and then lost connection, then the server will delete the original tasks
@@ -263,8 +260,8 @@ func (w *workerProxy) HandleWorkerJoin(workerID int) {
 	}
 }
 
-func (w *workerProxy) getSubResults(parentTask *Task) []Result {
-	subresults := make([]Result, 0)
+func (w *workerProxy) getSubResults(parentTask *Task) []*bitcoin.Message {
+	subresults := make([]*bitcoin.Message, 0)
 	for _, subid := range parentTask.GetSubtasks() {
 		subtask := w.getTask(subid)
 		subresults = append(subresults, subtask.Result)
@@ -364,7 +361,7 @@ func (w *workerProxy) isAllTaskFinished(task *Task) bool {
 
 // helper types
 type resMsg struct {
-	req      Request
+	req      *bitcoin.Message
 	clientID int
 }
 
@@ -376,11 +373,11 @@ func NewResMsgQueue() *resMsgQueue {
 	return &resMsgQueue{list.New()}
 }
 
-func (q *resMsgQueue) Push(req Request, clientID int) {
+func (q *resMsgQueue) Push(req *bitcoin.Message, clientID int) {
 	q.queue.PushBack(&resMsg{req, clientID})
 }
 
-func (q *resMsgQueue) Pop() (Request, int, error) {
+func (q *resMsgQueue) Pop() (*bitcoin.Message, int, error) {
 	if q.Len() <= 0 {
 		return nil, 0, fmt.Errorf("pop from empty queue")
 	}

@@ -2,7 +2,6 @@ package bitcoin
 
 import "encoding/json"
 
-// TODO make it thread-safe
 type IntSet struct {
 	set map[int]bool
 }

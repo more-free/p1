@@ -2,7 +2,15 @@ package bitcoin
 
 /*
 modified a little bit for the original structures :
-add ID field to Result message
+for Request message (server -> worker), use Nonce field as task ID;
+for Result message (worker -> server), use Lower field as task ID (the same task ID as request message);
+for server -> client, client -> server, the ID field doesn't matter.
+
+result ID is encoded to let the server identify which request it belongs to.
+when result is sent from miner to server, the id indicates a unique subtask id
+storing on the server side.
+
+note normally it should modify the Message struct to add a separate ID field instead of encoding ID with trick.
 */
 
 import "fmt"
@@ -19,7 +27,6 @@ const (
 // mining distributed system. Messages must be marshalled into a byte slice before being
 // sent over the network.
 type Message struct {
-	Id           int
 	Type         MsgType
 	Data         string
 	Lower, Upper uint64
@@ -37,14 +44,10 @@ func NewRequest(data string, lower, upper uint64) *Message {
 	}
 }
 
-// result ID is encoded to let the server identify which request it belongs to.
-// when result is sent from miner to server, the id indicates a unique subtask id
-// storing on the server side.
 // New result creates a result message. Miners send result messages to the server
 // and the server sends result messages to clients.
-func NewResult(id int, hash, nonce uint64) *Message {
+func NewResult(hash, nonce uint64) *Message {
 	return &Message{
-		Id:    id,
 		Type:  Result,
 		Hash:  hash,
 		Nonce: nonce,
@@ -70,16 +73,31 @@ func (m *Message) String() string {
 }
 
 // helpers
-func RequestEquals(this, that *Message) bool {
-	return this.Data == that.Data && this.Lower == that.Lower &&
-		this.Upper == that.Upper && this.Type == that.Type
-}
-
 func SubRequest(lower uint64, upper uint64, request *Message) *Message {
 	return &Message{
 		Type:  Request,
 		Data:  request.Data,
 		Lower: lower,
 		Upper: upper,
+	}
+}
+
+func (m *Message) SetID(id int) {
+	switch m.Type {
+	case Request:
+		m.Nonce = uint64(id)
+	case Result:
+		m.Lower = uint64(id)
+	}
+}
+
+func (m *Message) GetID() int {
+	switch m.Type {
+	case Request:
+		return int(m.Nonce)
+	case Result:
+		return int(m.Lower)
+	default:
+		return -1
 	}
 }
